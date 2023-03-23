@@ -1,0 +1,394 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <AccelStepper.h>
+#include <SPI.h>
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include "ESP8266WiFiMulti.h"
+#include <ESP8266mDNS.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <PID_v1.h>
+#include <SensirionI2cScd30.h>
+#include <SensirionI2CSht4x.h>
+#include <ArduinoJson.h>
+
+union eeprom_convert{
+  double d;
+  byte b[8];
+};
+
+ESP8266WiFiMulti WiFiMulti;
+
+
+ESP8266WebServer server(80);
+
+
+const char* ssid_ap = "while_AC";
+const char* password_ap = "while1213";
+
+SensirionI2cScd30 scd30;
+uint16_t scd30_status;
+float scd30_co2Concentration,scd30_temperature,scd30_humidity;
+
+#define pid_setpoint_add 0
+#define pid_aggKp_add 8
+#define pid_aggKi_add 16
+#define pid_aggKd_add 24
+#define pid_consKp_add 32
+#define pid_consKi_add 40
+#define pid_consKd_add 48
+#define setMaxSpeed_add 56
+#define setAcceleration_add 64
+#define SetOutputLimits_min_add 72
+#define SetOutputLimits_max_add 80
+#define SetSampleTime_add 88
+
+double pid_setpoint,setMaxSpeed, setAcceleration,SetOutputLimits_min,SetOutputLimits_max,SetSampleTime,pid_input, pid_output; //double pid_setpoint, pid_input, pid_output;
+float pid_aggKp,pid_aggKi,pid_aggKd,pid_consKp,pid_consKi,pid_consKd;
+/*
+float pid_aggKp = 4; 
+float pid_aggKi = 0.2; 
+float pid_aggKd = 1.0; 
+float pid_consKp = 1.0;
+float pid_consKi = 0.05;
+float pid_consKd = 0.25;*/
+
+PID myPID(&pid_input, &pid_output, &pid_setpoint, pid_consKp, pid_consKi, pid_consKd, REVERSE);  //double consKp=1, consKi=0.05, consKd=0.25;
+
+#define Sevo_A 0
+#define Sevo_B 14
+#define Sevo_C 2
+#define Sevo_D 12
+ 
+#define HALFSTEP 8    //半步进参数
+AccelStepper stepper(HALFSTEP, Sevo_A, Sevo_B, Sevo_C, Sevo_D); //引脚位置3,5,4,6
+
+
+void setup() {
+
+  Serial.begin(115200);
+  ota(); // Wifi OTA升级程序
+
+  EEPROM.begin(512);
+  eeprom_init_read();
+
+  //SCD30
+  Wire.begin();
+  scd30.begin(Wire, SCD30_I2C_ADDR_61);
+  scd30.stopPeriodicMeasurement();
+  scd30.softReset();
+  delay(2000);
+
+  scd30.setMeasurementInterval(2);// 检查间隔
+  scd30.activateAutoCalibration(0);//关闭自动校准
+  scd30.startPeriodicMeasurement(0); // 开始自动测量
+
+  stepper.setMaxSpeed(setMaxSpeed); //设置最大速度
+  stepper.setAcceleration(setAcceleration); //设置最小速度
+
+  myPID.SetOutputLimits(SetOutputLimits_min, SetOutputLimits_max); //0-1055(最大值)
+  myPID.SetSampleTime(SetSampleTime);//设定间隔时间（ms）
+  myPID.SetMode(AUTOMATIC);
+
+  pinMode(13, INPUT); // 汽车电源
+
+
+  // WIFI 模块设定 ---------------------------------
+  WiFi.mode(WIFI_AP_STA); //WIFI_AP_STA
+  WiFiMulti.addAP("while_pgy", "while1213");
+  WiFiMulti.addAP("ASUS_2G", "while1213");
+  WiFi.softAP(ssid_ap, password_ap);
+  while(WiFiMulti.run() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  IPAddress local_IP = WiFi.localIP();  local_IP[3] = 173;
+  WiFi.config(local_IP, WiFi.gatewayIP(), WiFi.subnetMask());
+  Serial.println("");
+  Serial.println(WiFi.localIP());
+  Serial.println(WiFi.gatewayIP());
+  Serial.println(WiFi.subnetMask());
+  // WIFI 模块设定 ---------------------------------
+
+  server.begin();  //初始化WebServer
+  server.on("/", homepage);  //设置主页处理函数
+  server.on("/ota", start_ota);  //开始ota
+  server.on("/getdata", getdata);  //获取数据
+  server.on("/reboot", reboot);  //reboot
+  server.onNotFound(handleNotFound);  //设置404页面
+}
+
+
+void loop() {
+
+  scd30.getDataReady(scd30_status);
+  if(scd30_status)
+  { 
+    scd30.blockingReadMeasurementData(scd30_co2Concentration, scd30_temperature,scd30_humidity);
+    pid_compute();
+  }
+  stepper.run();
+  
+  if(!stepper.distanceToGo()){
+    digitalWrite(Sevo_A, 0);digitalWrite(Sevo_B, 0);digitalWrite(Sevo_C, 0);digitalWrite(Sevo_D, 0);
+  }
+
+  ArduinoOTA.handle();
+  server.handleClient();  //监听客户请求并处理
+}
+
+
+
+void ota(void)
+{
+  ArduinoOTA.setPassword("while1213");
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_FS
+      type = "filesystem";
+    }
+    stepper.runToNewPosition(0); // 复位电机0
+    stepper.disableOutputs(); //关闭输出
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.begin();
+}
+
+
+void getdata() {
+
+  char scd30_temperature_c[10];
+  char scd30_humidity_c[10];
+  char pid_aggKp_c[10];
+  char pid_aggKi_c[10];
+  char pid_aggKd_c[10];
+  char pid_consKp_c[10];
+  char pid_consKi_c[10];
+  char pid_consKd_c[10];
+
+
+  dtostrf (scd30_temperature, 6, 1, scd30_temperature_c);
+  dtostrf (scd30_humidity, 6, 1, scd30_humidity_c);
+  dtostrf (pid_aggKp, 6, 2, pid_aggKp_c);
+  dtostrf (pid_aggKi, 6, 2, pid_aggKi_c);
+  dtostrf (pid_aggKd, 6, 2, pid_aggKd_c);
+  dtostrf (pid_consKp, 6, 2, pid_consKp_c);
+  dtostrf (pid_consKi, 6, 2, pid_consKi_c);
+  dtostrf (pid_consKd, 6, 2, pid_consKd_c);
+
+  StaticJsonDocument<1000> doc;
+
+  doc["scd30_Co2"] = int(scd30_co2Concentration);
+  doc["scd30_temperature"] = scd30_temperature_c;
+  doc["scd30_humidity"]= scd30_humidity_c;
+  doc["pid_output"]= int(pid_output);
+
+  doc["motor_position"]= int(stepper.currentPosition());
+
+  doc["pid_setpoint"]= int(pid_setpoint);
+
+  doc["pid_aggKp"]= pid_aggKp_c;
+  doc["pid_aggKi"]= pid_aggKi_c;
+  doc["pid_aggKd"]= pid_aggKd_c;
+
+  doc["pid_consKp"]= pid_consKp_c;
+  doc["pid_consKi"]= pid_consKi_c;
+  doc["pid_consKd"]= pid_consKd_c;
+
+  doc["setMaxSpeed"]= int(setMaxSpeed);
+  doc["setAcceleration"]= int(setAcceleration);
+  doc["SetOutputLimits_min"]= int(SetOutputLimits_min);
+  doc["SetOutputLimits_max"]= int(SetOutputLimits_max);
+  doc["SetSampleTime"]= int(SetSampleTime);
+
+  doc["moto_position"]= "-";
+  doc["esp_getfreeheap"]= ESP.getFreeHeap();
+
+  String json_output; // 创建一个字符串对象
+  
+  serializeJsonPretty(doc,json_output);
+  server.sendHeader("Access-Control-Allow-Origin", "*"); // 发送CORS头部，允许跨域访问
+  server.send(200, "application/json", json_output); // 发送200状态码，application/json内容类型，和JSON字符串作为响应体
+
+}
+
+
+void start_ota(){
+    stepper.runToNewPosition(0); // 复位电机0
+    stepper.disableOutputs(); //关闭输出
+    server.send(200, "text/plain", "The stepper motor has been reset and is ready for an upgrade!");
+    int time_out = 0;
+    while(time_out <3000){
+      ArduinoOTA.handle();
+      server.handleClient();  //监听客户请求并处理
+      time_out++;
+      delay(100);
+    }
+}
+
+void reboot(){
+  server.send(200, "text/plain", "Reboot the device......");
+  delay(1000);
+  ESP.restart();
+}
+ 
+// 设置主页请求处理函数
+void homepage() {
+  echo_args();
+}
+ 
+void handleNotFound() {                                       // 当浏览器请求的网络资源无法在服务器找到时，
+  server.send(404, "text/plain", "404: Not found");           // NodeMCU将调用此函数。
+  echo_args();
+}
+
+//自定义返回请求体信息
+void echo_args() {
+
+  if (server.hasArg("pid_setpoint")) {
+    pid_setpoint = server.arg("pid_setpoint").toFloat();
+    eeprom_write(pid_setpoint_add,pid_setpoint);
+  }
+
+  if (server.hasArg("pid_aggKp")) {
+    pid_aggKp = server.arg("pid_aggKp").toFloat();
+    eeprom_write(pid_aggKp_add,pid_aggKp);
+  }
+
+   if (server.hasArg("pid_aggKi")) {
+    pid_aggKi = server.arg("pid_aggKi").toFloat();
+    eeprom_write(pid_aggKi_add,pid_aggKi);
+  }  
+
+   if (server.hasArg("pid_aggKd")) {
+    pid_aggKd = server.arg("pid_aggKd").toFloat();
+    eeprom_write(pid_aggKd_add,pid_aggKd);
+  }    
+
+   if (server.hasArg("pid_consKp")) {
+    pid_consKp = server.arg("pid_consKp").toFloat();
+    eeprom_write(pid_consKp_add,pid_consKp);
+  }    
+
+   if (server.hasArg("pid_consKi")) {
+    pid_consKi = server.arg("pid_consKi").toFloat();
+    eeprom_write(pid_consKi_add,pid_consKi);
+  }    
+
+   if (server.hasArg("pid_consKd")) {
+    pid_consKd = server.arg("pid_consKd").toFloat();
+    eeprom_write(pid_consKd_add,pid_consKd);
+  }   
+
+   if (server.hasArg("setMaxSpeed")) {
+    setMaxSpeed = server.arg("setMaxSpeed").toFloat();
+    stepper.setMaxSpeed(setMaxSpeed); //设置最大速度
+    eeprom_write(setMaxSpeed_add,setMaxSpeed);
+  }   
+
+   if (server.hasArg("setAcceleration")) {
+    setAcceleration = server.arg("setAcceleration").toFloat();
+    stepper.setAcceleration(setAcceleration); //设置最小速度
+    eeprom_write(setAcceleration_add,setAcceleration);
+  }   
+
+   if (server.hasArg("SetOutputLimits_min")) {
+    SetOutputLimits_min = server.arg("SetOutputLimits_min").toFloat();
+    myPID.SetOutputLimits(SetOutputLimits_min, SetOutputLimits_max); //0-1055(最大值)
+    eeprom_write(SetOutputLimits_min_add,SetOutputLimits_min);
+  }   
+
+   if (server.hasArg("SetOutputLimits_max")) {
+    SetOutputLimits_max = server.arg("SetOutputLimits_max").toFloat();
+    myPID.SetOutputLimits(SetOutputLimits_min, SetOutputLimits_max); //0-1055(最大值)
+    eeprom_write(SetOutputLimits_max_add,SetOutputLimits_max);
+  }   
+
+   if (server.hasArg("SetSampleTime")) {
+    SetSampleTime = server.arg("SetSampleTime").toFloat();
+    myPID.SetSampleTime(SetSampleTime);//设定间隔时间（ms）
+    eeprom_write(SetSampleTime_add,SetSampleTime);
+  }   
+
+    if (server.hasArg("moto_position")) {
+
+      stepper.runToNewPosition(server.arg("moto_position").toInt()); 
+      stepper.disableOutputs(); //关闭输出
+      stepper.setCurrentPosition(0);//设定当前位置为0
+  }   
+  server.send(200, "text/plain", "Completed setup");
+}
+
+
+void pid_compute()
+{
+  if(digitalRead(13)==1)
+  {
+    pid_input = scd30_co2Concentration;
+    double gap = abs(pid_setpoint - pid_input); //distance away from setpoint
+
+    if (gap < 2000)
+    { 
+      myPID.SetTunings(pid_consKp, pid_consKi, pid_consKd);
+    }
+    else
+    {
+      myPID.SetTunings(pid_aggKp, pid_aggKi, pid_aggKd);
+    }
+    myPID.Compute();
+    stepper.moveTo(pid_output);
+  }
+  else {
+    stepper.moveTo(0);
+    pid_output = 0;
+  }
+
+}
+
+void eeprom_write(int add,double data)
+{
+  eeprom_convert data_convert;
+  data_convert.d = data;
+  for(int i=0;i<8;i++)
+  {
+    EEPROM.write(add+i,data_convert.b[i]);
+  }
+  EEPROM.commit();
+}
+
+double eeprom_read(int add)
+{
+  eeprom_convert data_convert;
+  for(int i=0;i<8;i++)
+  {
+    data_convert.b[i] = EEPROM.read(add+i);
+  }
+  return data_convert.d;
+}
+
+void eeprom_init_read()
+{
+  pid_setpoint = eeprom_read( pid_setpoint_add);
+  pid_aggKp = eeprom_read(pid_aggKp_add);
+  pid_aggKi = eeprom_read(pid_aggKi_add);
+  pid_aggKd = eeprom_read(pid_aggKd_add);
+  pid_consKp = eeprom_read(pid_consKp_add);
+  pid_consKi = eeprom_read(pid_consKi_add);
+  pid_consKd = eeprom_read(pid_consKd_add);
+  setMaxSpeed = eeprom_read(setMaxSpeed_add);
+  setAcceleration = eeprom_read(setAcceleration_add);
+  SetOutputLimits_min = eeprom_read(SetOutputLimits_min_add);
+  SetOutputLimits_max = eeprom_read(SetOutputLimits_max_add);
+  SetSampleTime = eeprom_read(SetSampleTime_add);
+}
+
